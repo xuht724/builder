@@ -2364,6 +2364,44 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+			
+		from, err := types.Sender(signer, tx)
+		if err != nil {
+			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+		}
+
+		var acl types.AccessList
+		var aclvmerr error
+		var aclerr error
+		if tx.AccessList() == nil || tx.AccessList().StorageKeys() == 0 {
+			nonce := hexutil.Uint64(tx.Nonce())
+			accessList := tx.AccessList()
+			data := hexutil.Bytes(tx.Data())
+			gas := hexutil.Uint64(tx.Gas())
+			txArgs := TransactionArgs{
+				From:       &from,
+				To:         tx.To(),
+				Gas:        &gas,
+				Value:      (*hexutil.Big)(tx.Value()),
+				Nonce:      &nonce,
+				Data:       &data,
+				Input:      &data,
+				AccessList: &accessList,
+				ChainID:    (*hexutil.Big)(tx.ChainId()),
+			}
+
+			if tx.GasPrice() != nil {
+				txArgs.GasPrice = (*hexutil.Big)(tx.GasPrice())
+			} else {
+				txArgs.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+				txArgs.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+			}
+			acl, _, aclvmerr, aclerr = AccessList2(state, s.b, *header, txArgs, &coinbase, s.chain)
+		} else {
+			acl = tx.AccessList()
+			aclvmerr = nil
+			aclerr = nil
+		}
 
 		coinbaseBalanceBeforeTx := state.GetBalance(coinbase)
 		state.SetTxContext(tx.Hash(), i)
@@ -2374,7 +2412,7 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		}
 
 		txHash := tx.Hash().String()
-		from, err := types.Sender(signer, tx)
+		from, err = types.Sender(signer, tx)
 		if err != nil {
 			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
 		}
@@ -2422,6 +2460,17 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 			totalBlobGasUsed += receipt.BlobGasUsed
 			jsonResult["blobGasUsed"] = receipt.BlobGasUsed
 		}
+
+		jsonResult["logs"] = receipt.Logs
+		jsonResult["accessList"] = &acl
+		if aclvmerr == nil {
+			jsonResult["accessListVmErr"] = aclvmerr
+		} else {
+			jsonResult["accessListVmErr"] = aclvmerr.Error()
+		}
+		jsonResult["accessListErr"] = aclerr
+
+
 		results = append(results, jsonResult)
 	}
 
@@ -2441,6 +2490,96 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 
 	ret["bundleHash"] = "0x" + common.Bytes2Hex(bundleHash.Sum(nil))
 	return ret, nil
+}
+
+
+func toArgs(tx *types.Transaction, from common.Address) (txArgs TransactionArgs) {
+	nonce := hexutil.Uint64(tx.Nonce())
+	accessList := tx.AccessList()
+	data := hexutil.Bytes(tx.Data())
+	gas := hexutil.Uint64(tx.Gas())
+	ret := TransactionArgs{
+		From:       &from,
+		To:         tx.To(),
+		Gas:        &gas,
+		Value:      (*hexutil.Big)(tx.Value()),
+		Nonce:      &nonce,
+		Data:       &data,
+		Input:      &data,
+		AccessList: &accessList,
+		ChainID:    (*hexutil.Big)(tx.ChainId()),
+	}
+
+	if tx.GasPrice() != nil {
+		txArgs.GasPrice = (*hexutil.Big)(tx.GasPrice())
+	} else {
+		txArgs.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+		txArgs.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+	}
+
+	return ret
+}
+
+// AccessList creates an access list for the given transaction.
+// If the accesslist creation fails an error is returned.
+// If the transaction itself fails, an vmErr is returned.
+func AccessList2(db *state.StateDB, b Backend, header types.Header, args TransactionArgs, author *common.Address, bc core.ChainContext) (acl types.AccessList, gasUsed uint64, vmErr error, err error) {
+	// Retrieve the execution context
+	// db, header, err := b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+
+	var to common.Address
+	if args.To != nil {
+		to = *args.To
+	} else {
+		to = crypto.CreateAddress(args.from(), uint64(*args.Nonce))
+	}
+	isPostMerge := header.Difficulty.Cmp(common.Big0) == 0
+	// Retrieve the precompiles since they don't need to be added to the access list
+	precompiles := vm.ActivePrecompiles(b.ChainConfig().Rules(header.Number, isPostMerge, header.Time))
+
+	// Create an initial tracer
+	prevTracer := logger.NewAccessListTracer(nil, args.from(), to, precompiles)
+	if args.AccessList != nil {
+		prevTracer = logger.NewAccessListTracer(*args.AccessList, args.from(), to, precompiles)
+	}
+	for {
+		// Retrieve the current access list to expand
+		accessList := prevTracer.AccessList()
+		log.Trace("Creating access list", "input", accessList)
+
+		// Copy the original db so we don't modify it
+		statedb := db.Copy()
+		// Set the accesslist to the last al
+		args.AccessList = &accessList
+		msg, err := args.ToMessage(b.RPCGasCap(), header.BaseFee)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+
+		// Apply the transaction with the access list tracer
+		tracer := logger.NewAccessListTracer(accessList, args.from(), to, precompiles)
+		config := vm.Config{Tracer: tracer, NoBaseFee: true}
+
+		blockContext := core.NewEVMBlockContext(&header, bc, author)
+		txCtx := vm.TxContext{
+			Origin:     msg.From,
+			GasPrice:   new(big.Int).Set(msg.GasPrice),
+			BlobHashes: msg.BlobHashes,
+		}
+		vmenv := vm.NewEVM(blockContext, txCtx, statedb, b.ChainConfig(), config)
+		// vmenv, _, err := b.GetEVM(ctx, msg, statedb, header, &config)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		res, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.GasLimit))
+		if err != nil {
+			return nil, 0, nil, fmt.Errorf("failed to apply transaction: %v err: %v", args.toTransaction().Hash(), err)
+		}
+		if tracer.Equal(prevTracer) {
+			return accessList, res.UsedGas, res.Err, nil
+		}
+		prevTracer = tracer
+	}
 }
 
 // EstimateGasBundleArgs represents the arguments for a call
